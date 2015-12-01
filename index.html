@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en-us">
+  <head>
+    <meta charset="UTF-8">
+    <title>Driver reverse by l0g1n</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" type="text/css" href="stylesheets/normalize.css" media="screen">
+    <link href='https://fonts.googleapis.com/css?family=Open+Sans:400,700' rel='stylesheet' type='text/css'>
+    <link rel="stylesheet" type="text/css" href="stylesheets/stylesheet.css" media="screen">
+    <link rel="stylesheet" type="text/css" href="stylesheets/github-light.css" media="screen">
+  </head>
+  <body>
+    <section class="page-header">
+      <h1 class="project-name">Driver reverse</h1>
+      <h2 class="project-tagline"></h2>
+      <a href="https://github.com/l0g1n/Driver_reverse" class="btn">View on GitHub</a>
+      <a href="https://github.com/l0g1n/Driver_reverse/zipball/master" class="btn">Download .zip</a>
+      <a href="https://github.com/l0g1n/Driver_reverse/tarball/master" class="btn">Download .tar.gz</a>
+    </section>
+
+    <section class="main-content">
+      <h1>
+<a id="驱动的逆向分析" class="anchor" href="#%E9%A9%B1%E5%8A%A8%E7%9A%84%E9%80%86%E5%90%91%E5%88%86%E6%9E%90" aria-hidden="true"><span class="octicon octicon-link"></span></a>驱动的逆向分析</h1>
+
+<h2>
+<a id="背景" class="anchor" href="#%E8%83%8C%E6%99%AF" aria-hidden="true"><span class="octicon octicon-link"></span></a>背景</h2>
+
+<p>近日得到一样本，主要行为是修改浏览器主页，被修改的浏览器主页无法改回，十分好奇是通过什么手段来修改的，也当作是对驱动分析的一次练手。</p>
+
+<p>样本信息：</p>
+
+<pre><code>样本名称：dffim.exe
+样本大小：955,392 字节
+样本MD5：8f6d7b4a888426a416c3eecf43e76ad0
+</code></pre>
+
+<h2>
+<a id="文件释放" class="anchor" href="#%E6%96%87%E4%BB%B6%E9%87%8A%E6%94%BE" aria-hidden="true"><span class="octicon octicon-link"></span></a>文件释放</h2>
+
+<p>样本运行后会释放三个驱动文件<code>dmvsc2.sys</code>、<code>HDAudBus2.sys</code>、<code>usbehci2.sys</code>，并对其进行解密，还会释放一个<code>DLL</code>，该文件是用来进行驱动加载的。样本会将三个驱动文件进行安装，然后退出。修改浏览器主页的行为是由驱动文件<code>dmvsc2.sys</code>来完成的，下面主要对该文件进行分析。</p>
+
+<h2>
+<a id="dmvsc2sys分析" class="anchor" href="#dmvsc2sys%E5%88%86%E6%9E%90" aria-hidden="true"><span class="octicon octicon-link"></span></a>dmvsc2.sys分析</h2>
+
+<p>我采用的方法是：<code>IDA</code>静态分析+<code>WinDbg</code>动态调试。</p>
+
+<h3>
+<a id="驱动调试" class="anchor" href="#%E9%A9%B1%E5%8A%A8%E8%B0%83%E8%AF%95" aria-hidden="true"><span class="octicon octicon-link"></span></a>驱动调试</h3>
+
+<p>对于驱动的动态调试，采用双机调试，至于怎么搭建环境，请google一下吧。</p>
+
+<p>虚拟机内，<code>OD</code>加载<code>dffim.exe</code>，执行到驱动安装的位置</p>
+
+<pre><code>00401E5B   .  FFD7          call edi                                 ;  zyinstal.ZY_INS
+00401E5D   .  8D9424 600600&gt;lea edx,dword ptr ss:[esp+0x660]
+00401E64   .  52            push edx
+00401E65   .  8D8424 840E00&gt;lea eax,dword ptr ss:[esp+0xE84]
+</code></pre>
+
+<p>使用<code>WinDbg</code>断下，在<code>WinDbg</code>内下模块加载断点<code>sxe ld:dmvsc2</code>（这里要注意，一定不能加后缀。）再输入命令<code>g</code>，恢复虚拟机的执行。在<code>OD</code>中，执行驱动安装。这时，<code>WinDbg</code>中会断下，使用命令<code>lm</code>查看模块的基地址，在<code>IDA</code>中调用<code>Edit-&gt;Segements-&gt;Rebase program</code>重置基地址，这样可以保证<code>IDA</code>与<code>WinDbg</code>的地址是一致的，方便后面的分析。</p>
+
+<pre><code>kd&gt; dt _image_dos_header b223c000
+nt!_IMAGE_DOS_HEADER
+   .
+   .
+   .
+   +0x03c e_lfanew         : 0n224
+kd&gt; dt -r2 _image_nt_headers b223c000+0n224
+nt!_IMAGE_NT_HEADERS
+      .
+      .
+      .
+      +0x010 AddressOfEntryPoint : 0x2334
+      .
+      .
+      .
+</code></pre>
+
+<p><code>0xb223c000</code>是我的基地址，每次加载会不同。通过上面两条命令，可以找到驱动程序<code>DriverEntry</code>的地址，在此处下<code>bp</code>断点，就可以开始驱动程序的调试。</p>
+
+<h3>
+<a id="驱动功能" class="anchor" href="#%E9%A9%B1%E5%8A%A8%E5%8A%9F%E8%83%BD" aria-hidden="true"><span class="octicon octicon-link"></span></a>驱动功能</h3>
+
+<ol>
+<li>注册进程回调函数</li>
+<li>注册映像加载回调函数</li>
+<li>创建内核线程执行操作（与主题无关，未分析）</li>
+<li>创建内核线程删除执行删除注册表（略过）</li>
+<li>遍历分区，获取信息（与主题无关，未分析）</li>
+<li>检查文件系统<code>\\FileSystem\\NTFS</code>（与主题无关，未分析）</li>
+</ol>
+
+<h3>
+<a id="进程回调函数" class="anchor" href="#%E8%BF%9B%E7%A8%8B%E5%9B%9E%E8%B0%83%E5%87%BD%E6%95%B0" aria-hidden="true"><span class="octicon octicon-link"></span></a>进程回调函数</h3>
+
+<h4>
+<a id="基础" class="anchor" href="#%E5%9F%BA%E7%A1%80" aria-hidden="true"><span class="octicon octicon-link"></span></a>基础</h4>
+
+<p>进程回调函数使用<code>PsSetCreateProcessNotifyRoutine</code>创建，函数原型如下：</p>
+
+<pre><code>NTSTATUS PsSetCreateProcessNotifyRoutine( 
+IN PCREATE_PROCESS_NOTIFY_ROUTINE NotifyRoutine, 
+IN BOOLEAN Remove 
+);
+</code></pre>
+
+<p><code>NotifyRoutine</code>为注册的回调函数地址，<code>Remove</code>为<code>TRUE</code>表示创建回调函数，为<code>FALSE</code>表示取消回调函数。</p>
+
+<p>回调函数原型如下：</p>
+
+<pre><code>VOID (*PCREATE_PROCESS_NOTIFY_ROUTINE) ( 
+IN HANDLE ParentId, 
+IN HANDLE ProcessId, 
+IN BOOLEAN Create 
+); 
+</code></pre>
+
+<p>其中，<code>ParentId</code>是父进程ID，<code>ProcessId</code>为进程ID，而<code>Create</code>表示进程创建或是退出，<code>TRUE</code>表示创建进程，<code>FALSE</code>表示结束进程。每当进程创建或结束时，就会触发该回调函数。</p>
+
+<h4>
+<a id="本次回调函数行为" class="anchor" href="#%E6%9C%AC%E6%AC%A1%E5%9B%9E%E8%B0%83%E5%87%BD%E6%95%B0%E8%A1%8C%E4%B8%BA" aria-hidden="true"><span class="octicon octicon-link"></span></a>本次回调函数行为</h4>
+
+<p>下面说一下<code>dmvsc2.sys</code>中回调函数的作用，通过<code>ZwQueryInformationProcess</code>获取当前进程的名称，计算进程的<code>CRC32</code>，判断是否为样本所关注的进程，若是，则修改主页。所关注的进程<code>CRC32</code>列表以链表的形式保存在内存中，在创建回调函数之前，进行初始化填充。下面的我提取出的列表，随便计算了几个浏览器的进程名，全部在该列表中。</p>
+
+<pre><code>CRC      进程名
+74fc6984
+0922df04 IEXPLORE.EXE
+bdeab0eb 360SE.EXE
+4d7c371d 360CHROME.EXE
+e0dcda05
+4467ba9c
+df87d85f BAIDUBROWSER.EXE
+81762398
+e9f3dc6f
+c84f40f0 CHROME.EXE
+662d9d39 FIREFOX.EXE
+04e48e16 LIEBAO.EXE
+cc7bf8dd MAXTHON.EXE
+60309c56 
+a3578083 QQBROWSER.EXE
+11aa3d47
+dcfc6e80
+2daddb99 SOGOUEXPLORER.EXE
+12116378
+6a0aa936
+83cd9976
+</code></pre>
+
+<p>注：<code>CRC32</code>的计算<code>hex((-1 - binascii.crc32('360SE.EXE')) &amp; 0xffffffff)</code></p>
+
+<p>对这些进程的后续操作，目前并未分析透彻。初步判断，在该部分中并未修改浏览器主页。</p>
+
+<h3>
+<a id="映像加载回调函数" class="anchor" href="#%E6%98%A0%E5%83%8F%E5%8A%A0%E8%BD%BD%E5%9B%9E%E8%B0%83%E5%87%BD%E6%95%B0" aria-hidden="true"><span class="octicon octicon-link"></span></a>映像加载回调函数</h3>
+
+<h4>
+<a id="基础-1" class="anchor" href="#%E5%9F%BA%E7%A1%80-1" aria-hidden="true"><span class="octicon octicon-link"></span></a>基础</h4>
+
+<p>映像加载回调函数使用函数<code>PsSetLoadImageNotifyRoutine</code>创建，函数原型如下：</p>
+
+<pre><code>NTSTATUS PsSetLoadImageNotifyRoutine(
+  _In_ PLOAD_IMAGE_NOTIFY_ROUTINE NotifyRoutine
+);
+</code></pre>
+
+<p><code>NotifyRoutine</code>为回调函数地址，回调函数原型如下：</p>
+
+<pre><code>VOID (*PLOAD_IMAGE_NOTIFY_ROUTINE)(
+    __in_opt PUNICODE_STRING  FullImageName,
+    __in HANDLE  ProcessId,
+    __in PIMAGE_INFO  ImageInfo
+    );
+</code></pre>
+
+<p><code>FullImageName</code>为完整映像名，<code>ProcessId</code>为进程ID，<code>ImageInfo</code>为映像指针。当驱动映像或用户映像（如：DLL或EXE)映射到虚拟内存时，会触发该回调函数，它的执行在映像映射到虚拟内存之后，未执行之前。</p>
+
+<h4>
+<a id="本次回调函数行为-1" class="anchor" href="#%E6%9C%AC%E6%AC%A1%E5%9B%9E%E8%B0%83%E5%87%BD%E6%95%B0%E8%A1%8C%E4%B8%BA-1" aria-hidden="true"><span class="octicon octicon-link"></span></a>本次回调函数行为</h4>
+
+<p>下面看一下<code>dmvsc2.sys</code>中映像回调函数都做了什么。</p>
+
+<ul>
+<li>
+<p>获取模块<code>ntdll</code>中的三个函数地址<code>LdrLoadDll</code>，<code>LdrGetProcedureAddress</code>，<code>NtProtectVirtualMemory</code></p>
+
+<pre><code>if ( !k_strcmp((int)FullImageName, &amp;s_ntdll) )// 不相等，则走LABEL_17
+  goto LABEL_17;
+v7 = (const void *)(v4 + 104);
+m_GetFuncAddress((int)ImageInfo-&gt;ImageBase, v4 + 104);// 获取三个函数的地址：
+                                            // LdrLoadDll
+                                            // LdrGetProcedureAddress
+                                            // NtProtectVirtualMemory
+</code></pre>
+</li>
+<li>
+<p>创建<code>Section</code>，并映射到内存</p>
+
+<pre><code>if ( ZwCreateSection(&amp;SectionHandle, 0xF001Fu, &amp;ObjectAttributes, &amp;MaximumSize, 0x40u, 0x8000000u, 0) &gt;= 0
+  &amp;&amp; ZwMapViewOfSection(
+       SectionHandle,
+       (HANDLE)0xFFFFFFFF,
+       &amp;BaseAddress,
+       0,
+       MaximumSize.LowPart,
+       &amp;SectionOffset,
+       &amp;ViewSize,
+       ViewUnmap,
+       0,
+       0x40u) &gt;= 0 )
+  memset(BaseAddress, 0, MaximumSize.LowPart);
+if ( SectionHandle )
+  ZwClose(SectionHandle);
+return BaseAddress;
+</code></pre>
+</li>
+<li>
+<p>将函数<code>0xB2331AFE</code>（此时基地址为：<code>0xB232F000</code>）复制到创建到的<code>Section</code>中</p>
+
+<pre><code>qmemcpy((char *)v6 + v4 + 40, sub_B2331AFE, 0x800u);// ///////
+</code></pre>
+</li>
+<li>
+<p>此时，对函数<code>0xB2331AFE</code>下断点，运行起来，会发现程序断下了，但位置却不是<code>0xB2331AFE</code>。原因是当下断点时，会把该函数第一个字节改为<code>CC</code>，后面当把这个函数复制到上面创建的<code>Section</code>时，断点也一起被复制过去了。在这里看到与之前的有所不同，前面的地址是：<code>001b:00157028</code>，<code>001b</code>是CS段的地址，CS段最后两位表示当前进程的权限级别，即CPL，<code>001b</code>的二进制为<code>0001 1011</code>，最低两位为<code>11</code>，表示现在进程是运行于<code>Ring3</code>状态下。</p>
+
+<pre><code>kd&gt; g
+Break instruction exception - code 80000003 (first chance)
+001b:00157028 cc              int     3
+</code></pre>
+</li>
+<li>
+<p>使用<code>eb</code>指令，将首字节的<code>CC</code>改为原来的<code>8B</code>，在此段代码中，会调用之前获取的三个函数<code>LdrLoadDll</code>，<code>LdrGetProcedureAddress</code>，<code>NtProtectVirtualMemory</code>，找到这三处代码调用的地方，下断点，如下：</p>
+
+<pre><code>001b:001570ce ff17            call    dword ptr [edi]   //LdrLoadDll
+001b:00157152 ff5708          call    dword ptr [edi+8]  //LdrGetProcedureAddress
+001b:001571bb ff5710          call    dword ptr [edi+10h]  //NtProtectVirtualMemory
+</code></pre>
+</li>
+<li>
+<p>还有一处需要注意的地方，当模块加载完成，函数地址获取完，权限设置好之后，会跳到新的地址处执行</p>
+
+<pre><code>001b:0015724a ffd0            call    eax
+</code></pre>
+</li>
+<li><p>将上面几个地方设置断点，就可以运行分析了。这里有一个技巧，因为这部分需要获取的函数地址太多，可以只记录加载的每个模块的基地址，再结合最后获取到的地址，通过IDA加载相关的DLL来判断该函数是什么。</p></li>
+<li>
+<code>Kernel32.dll</code>基地址：<code>7c800000</code>，函数地址保存位置：<code>0014b000</code>
+</li>
+<li>
+<code>User32.dll</code>基地址：<code>77d10000</code>，函数地址保存位置：<code>0014b170</code>
+</li>
+<li>
+<code>SHELL32.dll</code>基地址：<code>7d590000</code>，函数地址保存位置：<code>0014b15c</code>
+</li>
+<li>
+<code>SHLWAPI.dll</code>基地址：<code>77f40000</code>，函数地址保存位置：<code>0014b168</code>
+</li>
+<li>
+<code>PSAPI.dll</code>基地址：<code>76bc0000</code>，函数地址保存位置：<code>0014b154</code>
+</li>
+</ul>
+
+<p>下面是通过<code>IDA</code>获取的该模块可能会使用到的函数地址及名称。</p>
+
+<pre><code>    0014b000  7c809b74 VirtualFree
+    0014b004  7c80f9ed GetPrivateProfileStringW
+    0014b008  7c810e17 WriteFile
+    0014b00c  7c8309d1 OpenProcess
+    0014b010  7c802446 Sleep
+    0014b014  7c80b465 GetModuleFileNameW
+    0014b018  7c8107f0 CreateFileW
+    0014b01c  7c832748 GetPrivateProfileIntW
+    0014b020  7c80ae30 GetProcAddress
+    0014b024  7c809ae1 VirtualAlloc
+    0014b028  7c83019f GetDiskFreeSpaceW
+    0014b02c  7c80a864 GetLocalTime
+    0014b030  7c80997b GetCurrentThread
+    0014b034  7c801629 DeviceIoControl
+    0014b038  7c80b731 GetModuleHandleA
+    0014b03c  7c809bd7 CloseHandle
+    0014b040  7c8099b0 GetCurrentProcessId
+    0014b044  7c8106c7 CreateThread
+    0014b048  7c92fe01 ntdll!RtlGetLastWin32Error
+    0014b04c  7c80cd38 LCMapStringW
+    0014b050  7c838e00 LCMapStringA
+    0014b054  7c85b335 OutputDebugStringW
+    0014b058  7c8323ea CreateDirectoryW
+    0014b05c  7c802336 CreateProcessW
+    0014b060  7c810b07 GetFileSize
+    0014b064  7c81cafa ExitProcess
+    0014b068  7c80a520 GetStringTypeW
+    0014b06c  7c809c88 MultiByteToWideChar
+    0014b070  7c838a24 GetStringTypeA
+    0014b074  7c80d2f2 GetLocaleInfoA
+    0014b078  7c81115b IsValidCodePage
+    0014b07c  7c812837 GetOEMCP
+    0014b080  7c8099a5 GetACP
+    0014b084  7c812f06 GetCPInfo
+    0014b088  7c9304bd ntdll!RtlSizeHeap
+    0014b08c  7c80b8b9 InitializeCriticalSectionAndSpinCount
+    0014b090  7c8017e9 GetSystemTimeAsFileTime
+    0014b094  7c80932e GetTickCount
+    0014b098  7c80a4b7 QueryPerformanceCounter
+    0014b09c  7c812f98 GetEnvironmentStringsW
+    0014b0a0  7c80ac6e FreeLibrary
+    0014b0a4  7c801d7b LoadLibraryA
+    0014b0a8  7c80de85 GetCurrentProcess
+    0014b0ac  7c80ba61 VirtualQuery
+    0014b0b0  7c92fe10 ntdll!RtlRestoreLastWin32Error
+    0014b0b4  7c801ad4 VirtualProtect
+    0014b0b8  7c809832 InterlockedCompareExchange
+    0014b0bc  7c8097b8 GetCurrentThreadId
+    0014b0c0  7c83290f ResumeThread
+    0014b0c4  7c8355d4 FlushInstructionCache
+    0014b0c8  7c839725 GetThreadContext
+    0014b0cc  7c863aa9 SetThreadContext
+    0014b0d0  7c83974a SuspendThread
+    0014b0d4  7c92ff0d ntdll!RtlFreeHeap
+    0014b0d8  7c9300a4 ntdll!RtlAllocateHeap
+    0014b0dc  7c812fad GetCommandLineA
+    0014b0e0  7c812a99 RaiseException
+    0014b0e4  7c94aba5 ntdll!RtlUnwind
+    0014b0e8  7c801e1a TerminateProcess
+    0014b0ec  7c863e6a UnhandledExceptionFilter
+    0014b0f0  7c8449fd SetUnhandledExceptionFilter
+    0014b0f4  7c813123 IsDebuggerPresent
+    0014b0f8  7c812c46 HeapCreate
+    0014b0fc  7c810f88 HeapDestroy
+    0014b100  7c93135a ntdll!RtlDeleteCriticalSection
+    0014b104  7c9210e0 ntdll!RtlLeaveCriticalSection
+    0014b108  7c921000 ntdll!RtlEnterCriticalSection
+    0014b10c  7c939b80 ntdll!RtlReAllocateHeap
+    0014b110  7c80e4cd GetModuleHandleW
+    0014b114  7c812fc9 GetStdHandle
+    0014b118  7c80b55f GetModuleFileNameA
+    0014b11c  7c8097d0 TlsGetValue
+    0014b120  7c812e2f TlsAlloc
+    0014b124  7c809c55 TlsSetValue
+    0014b128  7c813767 TlsFree
+    0014b12c  7c8097f6 InterlockedIncrement
+    0014b130  7c80980a InterlockedDecrement
+    0014b134  7c80cd27 LockResource
+    0014b138  7c810ee1 GetFileType
+    0014b13c  7c801ef2 GetStartupInfoA
+    0014b140  7c81d6d7 FreeEnvironmentStringsA
+    0014b144  7c81cc7b GetEnvironmentStrings
+    0014b148  7c814b77 FreeEnvironmentStringsW
+    0014b14c  7c80a164 WideCharToMultiByte
+    0014b150  00000000
+    0014b154  76bc3d2f GetProcessImageFileNameW
+    0014b158  00000000
+    0014b15c  7d685bf0 ShellExecuteW
+    0014b160  7d5bed76 SHGetFolderPathW
+    0014b164  00000000
+    0014b168  77f47d89 PathFileExistsW
+    0014b16c  00000000
+    0014b170  77d2c9c3 FindWindowW
+    0014b174  77d2929a SendMessageW
+    0014b178  77d1e0e3 FindWindowExW
+    0014b17c  00000000
+    0014b180  00000000
+</code></pre>
+
+<p>该回调函数通过<code>call eax</code>直接跳转到核心的DLL模块中运行，这部分的分析至此结束，下面我们再开始对核心的DLL模块进行分析。</p>
+
+<h3>
+<a id="核心dll的分析" class="anchor" href="#%E6%A0%B8%E5%BF%83dll%E7%9A%84%E5%88%86%E6%9E%90" aria-hidden="true"><span class="octicon octicon-link"></span></a>核心DLL的分析</h3>
+
+<p>从<code>WinDbg</code>中提取出来核心DLL，修复一下文件头，使用<code>IDA</code>进行分析，该模块分析起来难度不大，会读取配置文件<code>config_temp.ini</code>。</p>
+
+<ul>
+<li>
+<p>内部含有两个<code>URL</code>，均为硬编码，进行了简单的加密，根据配置文件的信息来决定使用哪个<code>URL</code>，解密后的<code>URL</code></p>
+
+<pre><code>http://www.i1236.com/?tni=9431472574_hao
+http://www.hao123.com/?tn=93375910_hao_pg
+</code></pre>
+</li>
+<li>
+<p>解密脚本</p>
+
+<pre><code>&gt;&gt;&gt; s = '!jwxu@67xyz2mgv9351gts6Gup@=89&gt;=:33cmgvgqi'
+&gt;&gt;&gt; o = ''
+&gt;&gt;&gt; for i in xrange(len(s)):
+...     o += chr(ord(s[i])-1-(i%8))
+...
+&gt;&gt;&gt; o
+</code></pre>
+</li>
+<li>
+<p>修改浏览器主页方法有两种，针对不同的浏览器，使用不同的方法</p>
+
+<ul>
+<li>
+<p>使用<code>CreateProcessW</code>来创建带参数的浏览器窗口，参数如下：<code>C:\Program Files\Internet Explorer\iexplore.exe" http://www.i1236.com/?tni=9431472574_hao</code>，该方法针对下面的浏览器。</p>
+
+<pre><code>    if ( m_strcmp(lp_ImageName, (int)L"*\\iexplore.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\360se.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\360chrome.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\baidubrowser.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\hao123browser.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\Juzi.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\chrome.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\liebao.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\launcher.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\Safari.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\2345Explorer.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\2345chrome.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\firefox.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\Maxthon.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\rccb.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\SogouExplorer.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\TaoBrowser.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\TheWorld.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\UCBrowser.exe*")
+      || m_strcmp(lp_ImageName, (int)L"*\\YYExplorer.exe*") )
+</code></pre>
+</li>
+<li>
+<p>针对QQ浏览器(<code>QQBrowser.exe</code>)，使用<code>FindWindoW</code>，<code>FindWindowExW</code>来获取浏览器地址栏，向其写入参数。</p>
+
+<pre><code>    do
+    {
+      v2 = FindWindowW(L"QQBrowserMainFrame", 0);
+      v3 = FindWindowExW(v2, 0, L"QQBrowserRebar", 0);
+      v4 = FindWindowExW(v3, 0, L"QQBrowserAddressBar", 0);
+      v5 = FindWindowExW(v4, 0, L"QQBrowserCoreRichEdit", 0);
+    }
+    while ( !v5 );
+    v6 = 0;
+    do
+    {
+      v7 = v13[v6];
+      d_url[v6] = v7;
+      ++v6;
+    }
+    while ( v7 );
+    SendMessageW(v5, 0xCu, 0, (LPARAM)d_url);
+    SendMessageW(v5, 0x100u, 0xDu, 1);
+    SendMessageW(v5, 0x101u, 0xDu, 1);
+    Sleep(0x3E8u);
+    SendMessageW(v5, 0xCu, 0, (LPARAM)d_url);
+    SendMessageW(v5, 0x100u, 0xDu, 1);
+    return SendMessageW(v5, 0x101u, 0xDu, 1);
+</code></pre>
+</li>
+</ul>
+</li>
+</ul>
+
+<p>简单说一下<code>Dump</code>出来的文件，对文件头进行修复的方法。由于我们<code>Dump</code>的是内存中的文件，该文件的虚拟地址和虚拟大小，会被认为是原始地址和原始大小，而真正的虚拟地址和大小会不正常。导致IDA加载时，出现地址错乱等一系列的问题，这里，我们使用<code>PE</code>头修改工具，将虚拟地址和虚拟大小改为与原始地址和原始大小一样就可以正常加载。因为IDA正常识别出来了所使用的函数，上面获取的函数就没什么用了。</p>
+
+<h2>
+<a id="总结" class="anchor" href="#%E6%80%BB%E7%BB%93" aria-hidden="true"><span class="octicon octicon-link"></span></a>总结</h2>
+
+<p>样本通过<code>PE</code>文件释放驱动程序，并进行安装。驱动程序创建进程回调函数和映像加载回调函数。当发现浏览器进程被创建时，在映像加载之后，未执行之前，在映像内创建新的<code>Section</code>，写入修改浏览器主页的代码。对这个样本的分析持续了一周多的时间，但并未分析透彻，只是完成了最初的疑问，也对驱动调试有了新的认识。</p>
+
+<div align="right">(如有问题，请联系：l0g1n@qq.com)</div>
+
+      <footer class="site-footer">
+        <span class="site-footer-owner"><a href="https://github.com/l0g1n/Driver_reverse">Driver reverse</a> is maintained by <a href="https://github.com/l0g1n">l0g1n</a>.</span>
+
+        <span class="site-footer-credits">This page was generated by <a href="https://pages.github.com">GitHub Pages</a> using the <a href="https://github.com/jasonlong/cayman-theme">Cayman theme</a> by <a href="https://twitter.com/jasonlong">Jason Long</a>.</span>
+      </footer>
+
+    </section>
+
+  
+  </body>
+</html>
